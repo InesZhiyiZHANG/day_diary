@@ -19,25 +19,41 @@
   };
   const prettyDate = (date, options = { month: 'long', day: 'numeric', weekday: 'long' }) =>
     new Intl.DateTimeFormat('zh-CN', options).format(date);
-  const emptyData = () => ({ tasks: {}, moods: {}, journals: {}, rollovers: {}, carryChecks: {} });
+  const emptyData = () => ({ tasks: {}, moods: {}, journals: {}, rollovers: {}, carryChecks: {}, theme: 'berry' });
   const loadData = () => {
     try {
       const stored = JSON.parse(localStorage.getItem(STORE_KEY));
-      if (!stored || typeof stored !== 'object') return emptyData();
-      return {
-        tasks: stored.tasks && typeof stored.tasks === 'object' ? stored.tasks : {},
-        moods: stored.moods && typeof stored.moods === 'object' ? stored.moods : {},
-        journals: stored.journals && typeof stored.journals === 'object' ? stored.journals : {},
-        rollovers: stored.rollovers && typeof stored.rollovers === 'object' ? stored.rollovers : {},
-        carryChecks: stored.carryChecks && typeof stored.carryChecks === 'object' ? stored.carryChecks : {},
-      };
+      if (!stored || typeof stored !== 'object') return { pages: {} };
+      if (stored.pages && typeof stored.pages === 'object') return { pages: stored.pages };
+      // Migrate the previous single shared/local page without losing its records.
+      return { pages: { legacy: { ...emptyData(), ...stored } } };
     } catch {
-      return emptyData();
+      return { pages: {} };
     }
   };
 
-  const data = loadData();
   let currentUser = (() => { try { return JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null'); } catch { return null; } })();
+  let pages = loadData().pages;
+  let activePageId = currentUser?.id || 'local';
+  if (pages.legacy) { pages = { ...pages, ...splitLegacyState(pages.legacy) }; delete pages.legacy; }
+  pages[activePageId] ||= emptyData();
+  let pageData = pages[activePageId];
+  const data = new Proxy({}, {
+    get: (_target, key) => pageData[key],
+    set: (_target, key, value) => (pageData[key] = value, true),
+    deleteProperty: (_target, key) => (delete pageData[key], true),
+    ownKeys: () => Reflect.ownKeys(pageData),
+    getOwnPropertyDescriptor: (_target, key) => key in pageData ? { enumerable: true, configurable: true, value: pageData[key] } : undefined,
+  });
+  let viewingMemberId = activePageId;
+  function pageSnapshot() { pages[activePageId] = pageData; return { pages: JSON.parse(JSON.stringify(pages)) }; }
+  function claimLocalPage() {
+    if (!currentUser || currentUser.id === 'local' || !pages.local) return;
+    const own = pages[currentUser.id] || emptyData();
+    pages[currentUser.id] = mergeSharedState({ pages: { [currentUser.id]: own } }, { pages: { [currentUser.id]: pages.local } }).pages[currentUser.id];
+    delete pages.local;
+    if (activePageId === currentUser.id) pageData = pages[activePageId];
+  }
   let sharedMembers = [];
   let syncRevision = 0;
   let syncTimer;
@@ -82,7 +98,8 @@
   };
   const saveData = () => {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(data));
+      pages[activePageId] = pageData;
+      localStorage.setItem(STORE_KEY, JSON.stringify({ pages }));
       if (currentUser && syncReady && !applyingRemote) {
         pendingSync = true;
         localStorage.setItem(PENDING_KEY, '1');
@@ -135,29 +152,81 @@
     }
     return output;
   }
+  function splitLegacyState(state) {
+    const ownerOf = (record) => record?.createdById || record?.updatedById || currentUser?.id || activePageId;
+    const owners = new Set();
+    Object.values(state.tasks || {}).flat().forEach((record) => owners.add(ownerOf(record)));
+    Object.values(state.moods || {}).forEach((record) => owners.add(ownerOf(record)));
+    Object.values(state.journals || {}).forEach((record) => owners.add(ownerOf(record)));
+    if (!owners.size) owners.add(currentUser?.id || activePageId);
+    const output = Object.fromEntries([...owners].map((id) => [id, emptyData()]));
+    for (const [date, records] of Object.entries(state.tasks || {})) for (const record of records || []) (output[ownerOf(record)].tasks[date] ||= []).push(record);
+    for (const [date, record] of Object.entries(state.moods || {})) (output[ownerOf(record)].moods[date] = record);
+    for (const [date, record] of Object.entries(state.journals || {})) (output[ownerOf(record)].journals[date] = record);
+    for (const page of Object.values(output)) { page.rollovers = { ...(state.rollovers || {}) }; page.carryChecks = { ...(state.carryChecks || {}) }; }
+    return output;
+  }
   function mergeSharedState(local, remote) {
-    return {
-      tasks: mergeCollection(local.tasks, remote.tasks),
-      moods: mergeCollection(local.moods, remote.moods),
-      journals: mergeCollection(local.journals, remote.journals),
-      rollovers: { ...(remote.rollovers || {}), ...(local.rollovers || {}) },
-      carryChecks: { ...(remote.carryChecks || {}), ...(local.carryChecks || {}) },
-    };
+    const unwrap = (state) => state?.pages && typeof state.pages === 'object' ? state.pages : state && (state.tasks || state.moods || state.journals) ? splitLegacyState(state) : {};
+    const localPages = unwrap(local); const remotePages = unwrap(remote); const output = {};
+    for (const id of new Set([...Object.keys(remotePages), ...Object.keys(localPages)])) {
+      const l = localPages[id] || emptyData(); const r = remotePages[id] || emptyData();
+      output[id] = {
+        tasks: mergeCollection(l.tasks, r.tasks), moods: mergeCollection(l.moods, r.moods),
+        journals: mergeCollection(l.journals, r.journals),
+        rollovers: { ...(r.rollovers || {}), ...(l.rollovers || {}) },
+        carryChecks: { ...(r.carryChecks || {}), ...(l.carryChecks || {}) },
+        theme: Date.parse(l.themeUpdatedAt || '') >= Date.parse(r.themeUpdatedAt || '') ? (l.theme || r.theme || 'berry') : (r.theme || l.theme || 'berry'),
+        themeUpdatedAt: Date.parse(l.themeUpdatedAt || '') >= Date.parse(r.themeUpdatedAt || '') ? (l.themeUpdatedAt || r.themeUpdatedAt || '') : (r.themeUpdatedAt || l.themeUpdatedAt || ''),
+      };
+    }
+    return { pages: output };
   }
   function replaceData(next) {
-    for (const key of Object.keys(data)) delete data[key];
-    Object.assign(data, next && typeof next === 'object' ? next : {});
-    data.tasks ||= {}; data.moods ||= {}; data.journals ||= {}; data.rollovers ||= {}; data.carryChecks ||= {};
+    pages = mergeSharedState({}, next).pages;
+    pages[activePageId] ||= emptyData(); pageData = pages[activePageId];
+    pageData.tasks ||= {}; pageData.moods ||= {}; pageData.journals ||= {}; pageData.rollovers ||= {}; pageData.carryChecks ||= {}; pageData.theme ||= 'berry';
+    applyTheme();
   }
   function saveLocalOnly() {
     applyingRemote = true;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch { showToast('本地保存失败，请检查浏览器存储空间'); }
+    try { pages[activePageId] = pageData; localStorage.setItem(STORE_KEY, JSON.stringify({ pages })); } catch { showToast('本地保存失败，请检查浏览器存储空间'); }
     finally { applyingRemote = false; }
   }
   function setSyncStatus(state, label) {
     const button = $('#collab-open');
     button.dataset.state = state;
     $('#sync-label').textContent = label;
+  }
+  function applyTheme() {
+    const theme = pageData?.theme || 'berry';
+    document.documentElement.dataset.theme = theme;
+    const picker = $('#theme-picker');
+    if (picker) { picker.value = theme; picker.disabled = viewingMemberId !== currentUser?.id; }
+  }
+  function switchMemberPage(memberId) {
+    if (!memberId || !sharedMembers.some((member) => member.id === memberId)) return;
+    if (hasUnsavedDraft()) { $('#member-page-picker').value = viewingMemberId; showToast('先保存当前编辑，再切换计划页'); return; }
+    viewingMemberId = memberId;
+    activePageId = memberId;
+    pages[activePageId] ||= emptyData();
+    pageData = pages[activePageId];
+    $('#page-owner-label').textContent = `${sharedMembers.find((member) => member.id === memberId)?.displayName || '成员'}的计划页`;
+    $('#theme-label').textContent = memberId === currentUser?.id ? '我的页面风格' : '对方页面风格（只读）';
+    $('#member-page-picker').value = memberId;
+    applyTheme(); renderSharedState();
+    showToast(memberId === currentUser?.id ? '已回到自己的计划页' : '现在查看对方的计划页，可以直接帮忙修改');
+  }
+  function renderMemberPagePicker() {
+    const picker = $('#member-page-picker');
+    if (!picker) return;
+    picker.innerHTML = sharedMembers.map((member) => `<option value="${escapeHtml(member.id)}">${escapeHtml(member.displayName)}的计划</option>`).join('');
+    picker.value = viewingMemberId;
+    picker.disabled = sharedMembers.length < 2;
+    const owner = sharedMembers.find((member) => member.id === viewingMemberId);
+    $('#page-owner-label').textContent = owner ? `${owner.displayName}的计划页` : '我的计划页';
+    $('#theme-label').textContent = viewingMemberId === currentUser?.id ? '我的页面风格' : '对方页面风格（只读）';
+    applyTheme();
   }
   async function apiRequest(path, options = {}) {
     const response = await fetch(path, {
@@ -178,7 +247,7 @@
     if (!currentUser || !syncReady || syncBusy || !pendingSync || pendingConflict) return;
     syncBusy = true; pendingSync = false; setSyncStatus('pending', '正在同步');
     try {
-      const remote = await apiRequest('/api/state', { method: 'PUT', body: JSON.stringify({ baseRevision: syncRevision, state: data }) });
+      const remote = await apiRequest('/api/state', { method: 'PUT', body: JSON.stringify({ baseRevision: syncRevision, state: pageSnapshot() }) });
       syncRevision = remote.revision;
       sharedMembers = remote.members || sharedMembers;
       updateCollabUI();
@@ -212,9 +281,11 @@
   }
   function updateCollabUI() {
     $('#collab-open').classList.toggle('hidden', !currentUser);
+    $('#member-page-picker').closest('.member-page-control').classList.toggle('hidden', !currentUser);
     $('#invite-section').classList.toggle('hidden', sharedMembers.length >= 2);
     $('#member-avatars').innerHTML = sharedMembers.slice(0, 2).map((member) => `<span class="member-avatar" title="${escapeHtml(member.displayName)}">${escapeHtml(member.avatar || '🌷')}</span>`).join('');
     $('#member-list').innerHTML = sharedMembers.map((member) => `<div class="member-item"><span class="member-avatar">${escapeHtml(member.avatar || '🌷')}</span><div><strong>${escapeHtml(member.displayName)}</strong><small>${member.id === currentUser?.id ? '这是你' : '共享空间成员'}</small></div></div>`).join('');
+    renderMemberPagePicker();
   }
   function renderAuth(mode = 'login') {
     authMode = mode;
@@ -247,16 +318,17 @@
       authSetupRequired = status.setupRequired; authMemberCount = status.memberCount;
       try {
         const session = await apiRequest('/api/auth/me');
-        currentUser = session.user; sharedMembers = session.members;
+        currentUser = session.user; activePageId = currentUser.id; viewingMemberId = currentUser.id;
+        pages[activePageId] ||= emptyData(); pageData = pages[activePageId]; claimLocalPage(); sharedMembers = session.members;
         localStorage.setItem(PROFILE_KEY, JSON.stringify(currentUser));
         const remote = await apiRequest('/api/state');
-        const merged = mergeSharedState(data, remote.state);
+        const merged = mergeSharedState(pageSnapshot(), remote.state);
         const differs = JSON.stringify(merged) !== JSON.stringify(remote.state);
         replaceData(merged); attributeLegacyRecords(data); syncRevision = remote.revision; syncReady = true;
         carriedTaskCount += carryOverYesterday(false);
         saveLocalOnly(); updateCollabUI();
         renderSharedState();
-        const hasLocalChanges = JSON.stringify(data) !== JSON.stringify(remote.state);
+        const hasLocalChanges = JSON.stringify(pageSnapshot()) !== JSON.stringify(remote.state);
         if (differs || hasLocalChanges || pendingSync) { pendingSync = true; localStorage.setItem(PENDING_KEY, '1'); scheduleSync(250); } else setSyncStatus('synced', '已同步');
         reportCarryOver();
         return;
@@ -286,17 +358,20 @@
     if ('accountName' in credentials) { credentials.username = credentials.accountName; delete credentials.accountName; }
     const result = await apiRequest(endpoint, { method: 'POST', body: JSON.stringify(credentials) });
     currentUser = result.user;
+    activePageId = currentUser.id; viewingMemberId = currentUser.id;
+    pages[activePageId] ||= emptyData(); pageData = pages[activePageId];
+    claimLocalPage();
     localStorage.setItem(PROFILE_KEY, JSON.stringify(currentUser));
     if (result.inviteCode) $('#invite-code').textContent = result.inviteCode;
     const session = await apiRequest('/api/auth/me');
     sharedMembers = session.members;
     const remote = await apiRequest('/api/state');
-    const merged = mergeSharedState(data, remote.state);
+    const merged = mergeSharedState(pageSnapshot(), remote.state);
     replaceData(merged); attributeLegacyRecords(data); syncRevision = remote.revision; syncReady = true;
     carriedTaskCount += carryOverYesterday(false);
     saveLocalOnly(); updateCollabUI(); renderSharedState();
     $('#auth-overlay').hidden = true;
-    if (JSON.stringify(data) !== JSON.stringify(remote.state) || pendingSync) { pendingSync = true; localStorage.setItem(PENDING_KEY, '1'); scheduleSync(100); }
+    if (JSON.stringify(pageSnapshot()) !== JSON.stringify(remote.state) || pendingSync) { pendingSync = true; localStorage.setItem(PENDING_KEY, '1'); scheduleSync(100); }
     else { localStorage.removeItem(PENDING_KEY); setSyncStatus('synced', '已同步'); }
     if (result.inviteCode) {
       $('#collab-overlay').hidden = false;
@@ -313,8 +388,10 @@
   async function importBackupFile(file) {
     const parsed = JSON.parse(await file.text());
     const imported = parsed.state || parsed;
-    if (!imported || !imported.tasks || typeof imported.tasks !== 'object' || !imported.moods || typeof imported.moods !== 'object' || !imported.journals || typeof imported.journals !== 'object') throw new Error('备份文件内容不完整');
-    replaceData(mergeSharedState(data, imported));
+    const pageBackup = imported?.pages && typeof imported.pages === 'object';
+    const singlePageBackup = imported?.tasks && typeof imported.tasks === 'object' && imported?.moods && typeof imported.moods === 'object' && imported?.journals && typeof imported.journals === 'object';
+    if (!pageBackup && !singlePageBackup) throw new Error('备份文件内容不完整');
+    replaceData(mergeSharedState(pageSnapshot(), imported));
     saveData(); renderSharedState();
     showToast(currentUser ? '备份记录已合并，并开始同步' : '本机记录已导入；登录后会合并到共享空间');
   }
@@ -334,6 +411,7 @@
   }
   function hasUnsavedDraft() {
     if ($('#journal-saved').textContent === '有未保存的修改') return true;
+    if (selectedMood !== (data.moods[todayKey]?.mood || '')) return true;
     if ($('#mood-note').value !== (data.moods[todayKey]?.note || '')) return true;
     if ($('#task-list [data-task-edit-input]')) return true;
     if ($('#task-input').value.trim()) return true;
@@ -763,7 +841,7 @@
       carriedTaskCount += carryOverYesterday();
       renderSharedState(); reportCarryOver();
     }
-    else if (event.target.closest('[data-export-local]')) downloadJson(`莓好日常-本机备份-${todayKey}.json`, { exportedAt: new Date().toISOString(), state: data });
+    else if (event.target.closest('[data-export-local]')) downloadJson(`莓好日常-本机备份-${todayKey}.json`, { exportedAt: new Date().toISOString(), state: pageSnapshot() });
   });
   $('#auth-switch').addEventListener('change', async (event) => {
     if (event.target.id !== 'import-backup-file' || !event.target.files?.[0]) return;
@@ -778,6 +856,13 @@
     event.target.value = '';
   });
   $('#collab-open').addEventListener('click', () => { updateCollabUI(); $('#collab-overlay').hidden = false; });
+    $('#member-page-picker').addEventListener('change', (event) => switchMemberPage(event.target.value));
+  $('#theme-picker').addEventListener('change', (event) => {
+    if (viewingMemberId !== currentUser?.id) { applyTheme(); showToast('只能设置自己的页面风格'); return; }
+    pageData.theme = event.target.value === 'blue' ? 'blue' : 'berry';
+    pageData.themeUpdatedAt = new Date().toISOString();
+    applyTheme(); saveData();
+  });
   document.querySelectorAll('[data-close-modal]').forEach((button) => button.addEventListener('click', () => { $('#collab-overlay').hidden = true; }));
   $('#collab-overlay').addEventListener('click', (event) => { if (event.target === event.currentTarget) event.currentTarget.hidden = true; });
   $('#create-invite').addEventListener('click', async () => {
@@ -791,7 +876,7 @@
     try { await navigator.clipboard.writeText(shareText); showToast('地址和邀请码已复制'); }
     catch { showToast(`请复制地址和邀请码：${shareText}`); }
   });
-  $('#download-backup').addEventListener('click', () => downloadJson(`莓好日常共享备份-${todayKey}.json`, { exportedAt: new Date().toISOString(), revision: syncRevision, members: sharedMembers, state: data }));
+  $('#download-backup').addEventListener('click', () => downloadJson(`莓好日常共享备份-${todayKey}.json`, { exportedAt: new Date().toISOString(), revision: syncRevision, members: sharedMembers, state: pageSnapshot() }));
   $('#show-history').addEventListener('click', async () => {
     try {
       const result = await apiRequest('/api/history');
@@ -817,10 +902,10 @@
   $('#merge-and-sync').addEventListener('click', () => {
     if (!pendingConflict) return;
     const remote = pendingConflict;
-    const merged = mergeSharedState(data, remote.state);
+    const merged = mergeSharedState(pageSnapshot(), remote.state);
     replaceData(merged); syncRevision = remote.revision; sharedMembers = remote.members || sharedMembers;
     pendingConflict = null; $('#sync-conflict-overlay').hidden = true; saveLocalOnly(); updateCollabUI(); renderSharedState();
-    if (JSON.stringify(merged) !== JSON.stringify(remote.state)) { pendingSync = true; localStorage.setItem(PENDING_KEY, '1'); scheduleSync(100); }
+    if (JSON.stringify(pageSnapshot()) !== JSON.stringify(remote.state)) { pendingSync = true; localStorage.setItem(PENDING_KEY, '1'); scheduleSync(100); }
     else { localStorage.removeItem(PENDING_KEY); setSyncStatus('synced', '已同步'); }
     showToast('两边的记录已合并');
   });
@@ -831,7 +916,7 @@
     saveLocalOnly(); updateCollabUI(); renderSharedState(); setSyncStatus('synced', '已同步');
     showToast('已载入共享版本；本机未同步记录可先下载备份');
   });
-  $('#export-local').addEventListener('click', () => downloadJson(`莓好日常-冲突备份-${todayKey}.json`, { exportedAt: new Date().toISOString(), state: data }));
+  $('#export-local').addEventListener('click', () => downloadJson(`莓好日常-冲突备份-${todayKey}.json`, { exportedAt: new Date().toISOString(), state: pageSnapshot() }));
   $('#sync-conflict-overlay').addEventListener('click', (event) => { if (event.target === event.currentTarget) showToast('先选择合并、载入共享版本或下载备份'); });
 
   renderTasks();
